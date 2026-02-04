@@ -9,7 +9,12 @@ const errorHandler = ErrorHandler.getInstance();
  * Z.ai GLM Coding Plan Client
  *
  * Uses OpenAI-compatible API format with Z.ai's GLM models.
- * Documentation: https://docs.z.ai/devpack/overview
+ *
+ * Documentation:
+ * - Overview: https://docs.z.ai/devpack/overview
+ * - Chat Completion API: https://docs.z.ai/api-reference/llm/chat-completion
+ * - Function Calling: https://docs.z.ai/guides/capabilities/function-calling
+ * - Structured Output: https://docs.z.ai/guides/capabilities/struct-output
  *
  * Environment Variables:
  * - ZAI_API_KEY: Required API key from Z.ai
@@ -17,21 +22,34 @@ const errorHandler = ErrorHandler.getInstance();
  * - ZAI_BASE_URL: Custom base URL (default: https://api.z.ai/api/coding/paas/v4)
  *
  * Available Models:
- * - glm-4.7 (recommended, latest) - 200K context, 128K output
- * - glm-4.6
- * - glm-4.5
+ * - glm-4.7 (recommended, latest) - 200K context, 128K output, default temp 1.0
+ * - glm-4.7-flash - Faster variant
+ * - glm-4.6 - Previous generation
+ * - glm-4.5 - Default temp 0.6
  * - glm-4.5-air (faster, lighter)
  *
- * Compatibility Features:
- * - JSON request detection: Auto-adjusts temperature and system prompt for reliable JSON output
- * - Thinking tag stripping: Removes GLM's <think> blocks from responses
- * - OpenAI-compatible: Uses standard chat completion format
+ * Z.ai-Specific API Features:
+ * - response_format: {"type": "json_object"} for structured JSON output
+ * - thinking: {type: "enabled"|"disabled"} for chain-of-thought control
+ * - tools: Function calling with max 128 functions
+ * - tool_choice: "auto" for automatic function selection
+ * - do_sample: Boolean to enable/disable sampling (disables temp/top_p when false)
  *
  * GLM-4.7 Capabilities:
  * - Function/tool calling (OpenAI format)
  * - Interleaved thinking mode
  * - Strong coding benchmarks (LiveCodeBench-v6: 84.9, SWE-bench: 73.8%)
  */
+
+/**
+ * Extended parameters for Z.ai API that aren't in standard OpenAI SDK
+ */
+interface ZaiExtendedParams {
+  response_format?: { type: 'text' | 'json_object' };
+  thinking?: { type: 'enabled' | 'disabled'; clear_thinking?: boolean };
+  do_sample?: boolean;
+}
+
 export class ZaiClient implements LLMClient {
   private client: OpenAI;
   private model: string;
@@ -63,7 +81,7 @@ export class ZaiClient implements LLMClient {
     const {
       prompt,
       maxTokens = 4000,
-      temperature = 0.7,
+      temperature = 1.0, // GLM-4.7 default is 1.0 per official docs
       topP,
       presencePenalty,
       frequencyPenalty,
@@ -72,44 +90,43 @@ export class ZaiClient implements LLMClient {
       systemPrompt
     } = options;
 
-    // Detect JSON requests (matching Anthropic provider pattern for compatibility)
+    // Detect JSON requests to use official response_format parameter
     const isJsonRequest = systemPrompt?.includes('JSON') ||
                           systemPrompt?.includes('json') ||
                           prompt?.includes('JSON') ||
                           prompt?.includes('json');
 
-    let effectiveSystemPrompt = systemPrompt;
-    let effectiveTemperature = temperature;
-
-    if (isJsonRequest) {
-      // Enhance system prompt for reliable JSON output
-      if (!effectiveSystemPrompt) {
-        effectiveSystemPrompt = "CRITICAL: You are a pure JSON response system. You MUST ONLY output valid JSON with ABSOLUTELY NOTHING before or after it. ANY text outside the JSON will cause system failure.";
-      } else if (!effectiveSystemPrompt.toLowerCase().includes('json-only') && !effectiveSystemPrompt.toLowerCase().includes('pure json')) {
-        effectiveSystemPrompt = "CRITICAL: Output ONLY valid JSON with NOTHING else. ANY text outside the JSON will cause system failure.\n\n" + effectiveSystemPrompt;
-      }
-
-      // Lower temperature for more deterministic JSON output
-      if (effectiveTemperature > 0.1) {
-        effectiveTemperature = 0.05;
-      }
-    }
-
-    const params: OpenAI.Chat.ChatCompletionCreateParams = {
+    // Build base params
+    const baseParams: OpenAI.Chat.ChatCompletionCreateParams = {
       model: this.model,
-      messages: effectiveSystemPrompt
+      messages: systemPrompt
         ? [
-            { role: 'system', content: effectiveSystemPrompt },
+            { role: 'system', content: systemPrompt },
             { role: 'user', content: prompt }
           ]
         : [{ role: 'user', content: prompt }],
       max_tokens: maxTokens,
-      temperature: effectiveTemperature,
+      temperature: isJsonRequest ? Math.min(temperature, 0.3) : temperature, // Lower temp for JSON reliability
       top_p: topP,
       presence_penalty: presencePenalty,
       frequency_penalty: frequencyPenalty,
       stream: stream,
     };
+
+    // Add Z.ai-specific parameters using type assertion
+    const zaiParams: ZaiExtendedParams = {};
+
+    // Use official response_format for JSON mode (per Z.ai docs)
+    if (isJsonRequest) {
+      zaiParams.response_format = { type: 'json_object' };
+    }
+
+    // Disable thinking mode to prevent <think> blocks in output
+    // This uses the official API parameter instead of regex stripping
+    zaiParams.thinking = { type: 'disabled' };
+
+    // Merge params (Z.ai API accepts these additional fields)
+    const params = { ...baseParams, ...zaiParams } as OpenAI.Chat.ChatCompletionCreateParams;
 
     let retryCount = 0;
     let lastError: any = null;
@@ -152,7 +169,8 @@ export class ZaiClient implements LLMClient {
             }
           }
 
-          // Strip GLM thinking tags if present (GLM-4.7 may include <think> blocks)
+          // Fallback: strip thinking tags if API param didn't prevent them
+          // (defensive coding in case thinking param is ignored)
           const cleanedResponse = fullResponse.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
           return {
@@ -169,8 +187,7 @@ export class ZaiClient implements LLMClient {
 
           let text = response.choices[0]?.message?.content || '';
 
-          // Strip GLM thinking tags if present (GLM-4.7 may include <think> blocks)
-          // This matches the codebase's handling in taskManager.ts
+          // Fallback: strip thinking tags if API param didn't prevent them
           text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
           const usage: LLMUsage | null = response.usage
@@ -191,17 +208,20 @@ export class ZaiClient implements LLMClient {
       } catch (error) {
         lastError = error;
 
+        // Handle Z.ai-specific error conditions
+        const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+
         const isRetryable =
-          error instanceof Error &&
-          (error.message.includes('network') ||
-           error.message.includes('timeout') ||
-           error.message.includes('rate') ||
-           error.message.includes('limit') ||
-           error.message.includes('429') ||
-           error.message.includes('500') ||
-           error.message.includes('502') ||
-           error.message.includes('503') ||
-           error.message.includes('504'));
+          errorMessage.includes('network') ||
+          errorMessage.includes('timeout') ||
+          errorMessage.includes('rate') ||
+          errorMessage.includes('limit') ||
+          errorMessage.includes('429') ||
+          errorMessage.includes('500') ||
+          errorMessage.includes('502') ||
+          errorMessage.includes('503') ||
+          errorMessage.includes('504') ||
+          errorMessage.includes('network_error'); // Z.ai-specific finish_reason
 
         if (isRetryable && retryCount < this.maxRetries) {
           retryCount++;
@@ -257,19 +277,20 @@ export class ZaiClient implements LLMClient {
 
   /**
    * Test the connection to Z.ai API by making a minimal request.
-   * Returns true if the connection is successful, false otherwise.
-   * Useful for verifying API key validity and network connectivity.
+   * Uses thinking: disabled to minimize response overhead.
    */
   async testConnection(): Promise<{ success: boolean; message: string; latencyMs?: number }> {
     const startTime = Date.now();
 
     try {
+      // Use type assertion for Z.ai-specific params
       const response = await this.client.chat.completions.create({
         model: this.model,
         messages: [{ role: 'user', content: 'Hi' }],
         max_tokens: 5,
         temperature: 0,
-      });
+        thinking: { type: 'disabled' },
+      } as OpenAI.Chat.ChatCompletionCreateParams);
 
       const latencyMs = Date.now() - startTime;
       const hasContent = !!response.choices[0]?.message?.content;

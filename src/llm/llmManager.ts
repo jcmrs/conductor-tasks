@@ -68,7 +68,7 @@ const PROVIDER_DEFAULTS: { [key: string]: LLMModelDefaults } = {
   },
   zai: {
     model: 'glm-4.7',
-    temperature: 0.7,
+    temperature: 1.0, // GLM-4.7 official default per Z.ai docs
     maxTokens: 4000
   }
 };

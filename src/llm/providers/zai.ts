@@ -20,25 +20,41 @@ const errorHandler = ErrorHandler.getInstance();
  * - ZAI_API_KEY: Required API key from Z.ai
  * - ZAI_MODEL: Model to use (default: glm-4.7)
  * - ZAI_BASE_URL: Custom base URL (default: https://api.z.ai/api/coding/paas/v4)
+ * - ZAI_ENABLE_THINKING: Set to "true" to enable thinking mode (default: disabled)
  *
- * Available Models:
- * - glm-4.7 (recommended, latest) - 200K context, 128K output, default temp 1.0
+ * Available Text Models:
+ * - glm-4.7 (recommended) - 200K context, 128K output, temp default 1.0
  * - glm-4.7-flash - Faster variant
- * - glm-4.6 - Previous generation
- * - glm-4.5 - Default temp 0.6
- * - glm-4.5-air (faster, lighter)
+ * - glm-4.7-flashx - Extended flash variant
+ * - glm-4.6 - Previous generation, temp default 1.0
+ * - glm-4.5 - temp default 0.6, 96K max output
+ * - glm-4.5-air - Lighter variant
+ * - glm-4.5-x, glm-4.5-airx, glm-4.5-flash - Extended variants
+ * - glm-4-32b-0414-128k - 32B parameter model, 16K max output
+ *
+ * Available Vision Models:
+ * - glm-4.6v - 32K max output
+ * - glm-4.6v-flash, glm-4.6v-flashx
+ * - glm-4.5v - 16K max output
+ * - autoglm-phone-multilingual - 4K max output, temp default 0.0
  *
  * Z.ai-Specific API Features:
  * - response_format: {"type": "json_object"} for structured JSON output
  * - thinking: {type: "enabled"|"disabled"} for chain-of-thought control
- * - tools: Function calling with max 128 functions
+ * - do_sample: Boolean - when false, disables temperature/top_p for deterministic output
+ * - tools: Function calling with max 128 functions, includes web_search
  * - tool_choice: "auto" for automatic function selection
- * - do_sample: Boolean to enable/disable sampling (disables temp/top_p when false)
+ * - stop: String array (max 1 item) for generation terminators
  *
- * GLM-4.7 Capabilities:
- * - Function/tool calling (OpenAI format)
- * - Interleaved thinking mode
- * - Strong coding benchmarks (LiveCodeBench-v6: 84.9, SWE-bench: 73.8%)
+ * Finish Reasons:
+ * - stop: Normal completion
+ * - tool_calls: Model wants to call a function
+ * - length: Hit max_tokens limit
+ * - sensitive: Content moderation triggered
+ * - network_error: Network issue (retriable)
+ *
+ * Note: presence_penalty and frequency_penalty are passed through but may not
+ * be supported by Z.ai API (not documented). They may be silently ignored.
  */
 
 /**
@@ -48,6 +64,7 @@ interface ZaiExtendedParams {
   response_format?: { type: 'text' | 'json_object' };
   thinking?: { type: 'enabled' | 'disabled'; clear_thinking?: boolean };
   do_sample?: boolean;
+  stop?: string[];
 }
 
 export class ZaiClient implements LLMClient {
@@ -56,10 +73,12 @@ export class ZaiClient implements LLMClient {
   private maxRetries: number = 3;
   private apiKey?: string;
   private baseURL: string;
+  private enableThinking: boolean;
 
   constructor(model?: string, apiKey?: string, baseURL?: string) {
     this.apiKey = apiKey || process.env.ZAI_API_KEY;
     this.baseURL = baseURL || process.env.ZAI_BASE_URL || 'https://api.z.ai/api/coding/paas/v4';
+    this.enableThinking = process.env.ZAI_ENABLE_THINKING === 'true';
 
     if (!this.apiKey) {
       throw new Error('API key is required for Z.ai client (either passed or via ZAI_API_KEY env var)');
@@ -81,13 +100,14 @@ export class ZaiClient implements LLMClient {
     const {
       prompt,
       maxTokens = 4000,
-      temperature = 1.0, // GLM-4.7 default is 1.0 per official docs
+      temperature = 1.0, // GLM-4.7 official default per Z.ai docs
       topP,
       presencePenalty,
       frequencyPenalty,
       stream,
       onStreamUpdate,
-      systemPrompt
+      systemPrompt,
+      stopSequences
     } = options;
 
     // Detect JSON requests to use official response_format parameter
@@ -106,24 +126,45 @@ export class ZaiClient implements LLMClient {
           ]
         : [{ role: 'user', content: prompt }],
       max_tokens: maxTokens,
-      temperature: isJsonRequest ? Math.min(temperature, 0.3) : temperature, // Lower temp for JSON reliability
+      temperature: temperature,
       top_p: topP,
+      // Note: presence_penalty and frequency_penalty may not be supported by Z.ai
+      // They are passed through but may be silently ignored
       presence_penalty: presencePenalty,
       frequency_penalty: frequencyPenalty,
       stream: stream,
     };
 
-    // Add Z.ai-specific parameters using type assertion
+    // Add Z.ai-specific parameters
     const zaiParams: ZaiExtendedParams = {};
 
-    // Use official response_format for JSON mode (per Z.ai docs)
+    // Use official response_format for JSON mode
     if (isJsonRequest) {
       zaiParams.response_format = { type: 'json_object' };
+      // Use do_sample: false for deterministic JSON output (official Z.ai method)
+      zaiParams.do_sample = false;
     }
 
-    // Disable thinking mode to prevent <think> blocks in output
-    // This uses the official API parameter instead of regex stripping
-    zaiParams.thinking = { type: 'disabled' };
+    // Thinking mode: disabled by default for cleaner output, configurable via env
+    if (!this.enableThinking) {
+      zaiParams.thinking = { type: 'disabled' };
+    }
+
+    // Z.ai only supports 1 stop sequence (max items: 1)
+    if (stopSequences && stopSequences.length > 0) {
+      zaiParams.stop = [stopSequences[0]];
+      if (stopSequences.length > 1) {
+        errorHandler.handleError(
+          new TaskError(
+            `Z.ai only supports 1 stop sequence. Using first: "${stopSequences[0]}". Ignored: ${stopSequences.slice(1).join(', ')}`,
+            ErrorCategory.LLM,
+            ErrorSeverity.WARNING,
+            { operation: 'zai-complete' }
+          ),
+          true
+        );
+      }
+    }
 
     // Merge params (Z.ai API accepts these additional fields)
     const params = { ...baseParams, ...zaiParams } as OpenAI.Chat.ChatCompletionCreateParams;
@@ -169,9 +210,13 @@ export class ZaiClient implements LLMClient {
             }
           }
 
+          // Handle Z.ai-specific finish reasons
+          this.handleFinishReason(finishReason);
+
           // Fallback: strip thinking tags if API param didn't prevent them
-          // (defensive coding in case thinking param is ignored)
-          const cleanedResponse = fullResponse.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+          const cleanedResponse = this.enableThinking
+            ? fullResponse
+            : fullResponse.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
           return {
             text: cleanedResponse,
@@ -186,9 +231,15 @@ export class ZaiClient implements LLMClient {
           });
 
           let text = response.choices[0]?.message?.content || '';
+          const finishReason = response.choices[0]?.finish_reason;
+
+          // Handle Z.ai-specific finish reasons
+          this.handleFinishReason(finishReason);
 
           // Fallback: strip thinking tags if API param didn't prevent them
-          text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+          if (!this.enableThinking) {
+            text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+          }
 
           const usage: LLMUsage | null = response.usage
             ? {
@@ -202,7 +253,7 @@ export class ZaiClient implements LLMClient {
             text: text,
             usage: usage,
             model: response.model,
-            finishReason: response.choices[0]?.finish_reason || undefined,
+            finishReason: finishReason || undefined,
           };
         }
       } catch (error) {
@@ -221,7 +272,7 @@ export class ZaiClient implements LLMClient {
           errorMessage.includes('502') ||
           errorMessage.includes('503') ||
           errorMessage.includes('504') ||
-          errorMessage.includes('network_error'); // Z.ai-specific finish_reason
+          errorMessage.includes('network_error');
 
         if (isRetryable && retryCount < this.maxRetries) {
           retryCount++;
@@ -268,6 +319,45 @@ export class ZaiClient implements LLMClient {
   }
 
   /**
+   * Handle Z.ai-specific finish reasons
+   * - sensitive: Content moderation triggered
+   * - length: Output was truncated
+   * - tool_calls: Model wants to call a function
+   */
+  private handleFinishReason(finishReason: string | null | undefined): void {
+    if (!finishReason) return;
+
+    switch (finishReason) {
+      case 'sensitive':
+        errorHandler.handleError(
+          new TaskError(
+            'Z.ai content moderation triggered. The response may be incomplete or filtered.',
+            ErrorCategory.LLM,
+            ErrorSeverity.WARNING,
+            { operation: 'zai-complete', additionalInfo: { finishReason: 'sensitive' } }
+          ),
+          true
+        );
+        break;
+      case 'length':
+        errorHandler.handleError(
+          new TaskError(
+            'Z.ai response was truncated due to max_tokens limit.',
+            ErrorCategory.LLM,
+            ErrorSeverity.WARNING,
+            { operation: 'zai-complete', additionalInfo: { finishReason: 'length' } }
+          ),
+          true
+        );
+        break;
+      case 'tool_calls':
+        // This is informational - the model wants to call a function
+        // Logging at debug level since function calling isn't used in this codebase
+        break;
+    }
+  }
+
+  /**
    * Check if the provider is configured with an API key.
    * This is a synchronous check that does not verify connectivity.
    */
@@ -277,23 +367,32 @@ export class ZaiClient implements LLMClient {
 
   /**
    * Test the connection to Z.ai API by making a minimal request.
-   * Uses thinking: disabled to minimize response overhead.
+   * Uses thinking: disabled and do_sample: false for fast, deterministic response.
    */
   async testConnection(): Promise<{ success: boolean; message: string; latencyMs?: number }> {
     const startTime = Date.now();
 
     try {
-      // Use type assertion for Z.ai-specific params
       const response = await this.client.chat.completions.create({
         model: this.model,
         messages: [{ role: 'user', content: 'Hi' }],
         max_tokens: 5,
-        temperature: 0,
         thinking: { type: 'disabled' },
+        do_sample: false,
       } as OpenAI.Chat.ChatCompletionCreateParams);
 
       const latencyMs = Date.now() - startTime;
       const hasContent = !!response.choices[0]?.message?.content;
+      const finishReason = response.choices[0]?.finish_reason;
+
+      // Check for content moderation
+      if (finishReason === 'sensitive') {
+        return {
+          success: false,
+          message: 'Connection successful but test message was filtered by content moderation',
+          latencyMs,
+        };
+      }
 
       return {
         success: hasContent,

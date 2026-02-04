@@ -206,6 +206,63 @@ export class ZaiClient implements LLMClient {
     );
   }
 
+  /**
+   * Check if the provider is configured with an API key.
+   * This is a synchronous check that does not verify connectivity.
+   */
+  isAvailable(): boolean {
+    return !!this.apiKey;
+  }
+
+  /**
+   * Test the connection to Z.ai API by making a minimal request.
+   * Returns true if the connection is successful, false otherwise.
+   * Useful for verifying API key validity and network connectivity.
+   */
+  async testConnection(): Promise<{ success: boolean; message: string; latencyMs?: number }> {
+    const startTime = Date.now();
+
+    try {
+      const response = await this.client.chat.completions.create({
+        model: this.model,
+        messages: [{ role: 'user', content: 'Hi' }],
+        max_tokens: 5,
+        temperature: 0,
+      });
+
+      const latencyMs = Date.now() - startTime;
+      const hasContent = !!response.choices[0]?.message?.content;
+
+      return {
+        success: hasContent,
+        message: hasContent
+          ? `Connection successful. Model: ${response.model}`
+          : 'Connection established but no response content received',
+        latencyMs,
+      };
+    } catch (error) {
+      const latencyMs = Date.now() - startTime;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      errorHandler.handleError(
+        new TaskError(
+          `Z.ai connection test failed: ${errorMessage}`,
+          ErrorCategory.LLM,
+          ErrorSeverity.WARNING,
+          { operation: 'zai-testConnection' },
+          error instanceof Error ? error : undefined
+        ),
+        true
+      );
+
+      return {
+        success: false,
+        message: `Connection failed: ${errorMessage}`,
+        latencyMs,
+      };
+    }
+  }
+
   getProviderName(): string {
     return 'Z.ai';
   }

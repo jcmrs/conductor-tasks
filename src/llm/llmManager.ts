@@ -9,6 +9,7 @@ import { MistralProvider } from './providers/mistral.js';
 import { OllamaClient } from './providers/ollama.js';
 import { PerplexityClient } from './providers/perplexity.js';
 import { OpenRouterClient } from './providers/openrouter.js';
+import { ZaiClient } from './providers/zai.js';
 import { ErrorHandler, ErrorCategory, ErrorSeverity, TaskError } from '../core/errorHandler.js';
 import { refinePrompt } from '../core/promptRefinementService.js';
 
@@ -60,8 +61,13 @@ const PROVIDER_DEFAULTS: { [key: string]: LLMModelDefaults } = {
     temperature: 0.7,
     maxTokens: 4000
   },
-  openrouter: { 
-    model: 'mistralai/mistral-7b-instruct', 
+  openrouter: {
+    model: 'mistralai/mistral-7b-instruct',
+    temperature: 0.7,
+    maxTokens: 4000
+  },
+  zai: {
+    model: 'glm-4.7',
     temperature: 0.7,
     maxTokens: 4000
   }
@@ -76,7 +82,8 @@ const FALLBACK_ORDER = [
   'mixtral',
   'ollama',
   'perplexity',
-  'openrouter', 
+  'openrouter',
+  'zai',
   'xai'
 ];
 
@@ -253,12 +260,23 @@ export class LLMManager {
       const openrouterKey = process.env.OPENROUTER_API_KEY;
       if (openrouterKey) {
         try {
-          
-          
+
+
           const client = new OpenRouterClient(undefined, openrouterKey);
           this.providers.set('openrouter', { client });
         } catch (error) {
           console.warn(`Warning: Failed to initialize OpenRouter provider: ${error}`);
+        }
+      }
+
+      const zaiKey = process.env.ZAI_API_KEY;
+      if (zaiKey) {
+        try {
+          const zaiBaseURL = process.env.ZAI_BASE_URL;
+          const client = new ZaiClient(PROVIDER_DEFAULTS.zai?.model, zaiKey, zaiBaseURL);
+          this.providers.set('zai', { client });
+        } catch (error) {
+          console.warn(`Warning: Failed to initialize Z.ai provider: ${error}`);
         }
       }
 

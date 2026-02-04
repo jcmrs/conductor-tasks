@@ -17,10 +17,20 @@ const errorHandler = ErrorHandler.getInstance();
  * - ZAI_BASE_URL: Custom base URL (default: https://api.z.ai/api/coding/paas/v4)
  *
  * Available Models:
- * - glm-4.7 (recommended, latest)
+ * - glm-4.7 (recommended, latest) - 200K context, 128K output
  * - glm-4.6
  * - glm-4.5
  * - glm-4.5-air (faster, lighter)
+ *
+ * Compatibility Features:
+ * - JSON request detection: Auto-adjusts temperature and system prompt for reliable JSON output
+ * - Thinking tag stripping: Removes GLM's <think> blocks from responses
+ * - OpenAI-compatible: Uses standard chat completion format
+ *
+ * GLM-4.7 Capabilities:
+ * - Function/tool calling (OpenAI format)
+ * - Interleaved thinking mode
+ * - Strong coding benchmarks (LiveCodeBench-v6: 84.9, SWE-bench: 73.8%)
  */
 export class ZaiClient implements LLMClient {
   private client: OpenAI;
@@ -62,16 +72,39 @@ export class ZaiClient implements LLMClient {
       systemPrompt
     } = options;
 
+    // Detect JSON requests (matching Anthropic provider pattern for compatibility)
+    const isJsonRequest = systemPrompt?.includes('JSON') ||
+                          systemPrompt?.includes('json') ||
+                          prompt?.includes('JSON') ||
+                          prompt?.includes('json');
+
+    let effectiveSystemPrompt = systemPrompt;
+    let effectiveTemperature = temperature;
+
+    if (isJsonRequest) {
+      // Enhance system prompt for reliable JSON output
+      if (!effectiveSystemPrompt) {
+        effectiveSystemPrompt = "CRITICAL: You are a pure JSON response system. You MUST ONLY output valid JSON with ABSOLUTELY NOTHING before or after it. ANY text outside the JSON will cause system failure.";
+      } else if (!effectiveSystemPrompt.toLowerCase().includes('json-only') && !effectiveSystemPrompt.toLowerCase().includes('pure json')) {
+        effectiveSystemPrompt = "CRITICAL: Output ONLY valid JSON with NOTHING else. ANY text outside the JSON will cause system failure.\n\n" + effectiveSystemPrompt;
+      }
+
+      // Lower temperature for more deterministic JSON output
+      if (effectiveTemperature > 0.1) {
+        effectiveTemperature = 0.05;
+      }
+    }
+
     const params: OpenAI.Chat.ChatCompletionCreateParams = {
       model: this.model,
-      messages: systemPrompt
+      messages: effectiveSystemPrompt
         ? [
-            { role: 'system', content: systemPrompt },
+            { role: 'system', content: effectiveSystemPrompt },
             { role: 'user', content: prompt }
           ]
         : [{ role: 'user', content: prompt }],
       max_tokens: maxTokens,
-      temperature: temperature,
+      temperature: effectiveTemperature,
       top_p: topP,
       presence_penalty: presencePenalty,
       frequency_penalty: frequencyPenalty,
@@ -100,7 +133,7 @@ export class ZaiClient implements LLMClient {
         }
 
         if (stream && onStreamUpdate) {
-          const stream = await this.client.chat.completions.create({
+          const streamResponse = await this.client.chat.completions.create({
             ...params,
             stream: true,
           });
@@ -108,7 +141,7 @@ export class ZaiClient implements LLMClient {
           let fullResponse = '';
           let finishReason: string | null = null;
 
-          for await (const chunk of stream) {
+          for await (const chunk of streamResponse) {
             const content = chunk.choices[0]?.delta?.content || '';
             if (content) {
               fullResponse += content;
@@ -119,8 +152,11 @@ export class ZaiClient implements LLMClient {
             }
           }
 
+          // Strip GLM thinking tags if present (GLM-4.7 may include <think> blocks)
+          const cleanedResponse = fullResponse.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+
           return {
-            text: fullResponse,
+            text: cleanedResponse,
             usage: null,
             model: this.model,
             finishReason: finishReason || undefined,
@@ -131,7 +167,12 @@ export class ZaiClient implements LLMClient {
             stream: false,
           });
 
-          const text = response.choices[0]?.message?.content || '';
+          let text = response.choices[0]?.message?.content || '';
+
+          // Strip GLM thinking tags if present (GLM-4.7 may include <think> blocks)
+          // This matches the codebase's handling in taskManager.ts
+          text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+
           const usage: LLMUsage | null = response.usage
             ? {
                 promptTokens: response.usage.prompt_tokens,
